@@ -1,0 +1,156 @@
+import numpy as np
+import scipy
+import pandas as pd
+def initialize(context):
+    
+    context.stocks = [sid(32270),  #SSO
+                      sid(38294),  #TMF
+                      sid(21508),  #IJR
+                      sid(21507) ] #IJH
+    context.stock1 = sid(38054) #VXX
+    context.stock2 = sid(40516) #XIV
+   
+    schedule_function(func = allocVOL, date_rule = date_rules.every_day(), time_rule = time_rules.market_open(minutes = 15))
+  
+    #set_commission(commission.PerShare(cost = 0.0050, min_trade_cost = 1.00))
+    set_slippage(slippage.VolumeShareSlippage(volume_limit = 0.025, price_impact = 0.1))                  
+      
+    context.n = 0
+    context.s = np.zeros_like(context.stocks)
+    context.x0 = np.zeros_like(context.stocks)
+    context.x1 = 1.0*np.ones_like(context.stocks)/len(context.stocks)
+    
+    context.eps = 0.01
+    context.tol = 1.0e-6    #assume convergence is 10 time SLSQP ftol of 1e-6
+    context.valid_constraint_count = 0
+    context.opt_pass_count = 0
+    context.run_count = 0
+    context.eps_vals = []
+    
+    schedule_function(allocate,date_rules.every_day(),time_rules.market_open(minutes=60))
+    
+    schedule_function(trade,date_rules.week_start(days_offset=1),time_rules.market_open(minutes=60))
+    
+    set_commission(commission.PerTrade(cost=0))
+    
+    set_long_only()
+    
+    schedule_function(record_leverage, date_rules.every_day())
+
+def record_leverage(context, data):
+    record(leverage = context.account.leverage)
+
+def allocate(context, data):
+    context.run_count += 1
+    prices = data.history(context.stocks, 'price', 17*390,'1m')
+    ret = prices.pct_change()[1:].as_matrix(context.stocks)
+    ret_mean = prices.pct_change().mean()
+    ret_std = prices.pct_change().std()
+    ret_norm = ret_mean/ret_std
+    ret_norm = ret_norm.as_matrix(context.stocks)
+#
+#    alternate eps assignment method
+#
+    ret_norm_max = np.max(ret_norm)
+    eps_factor = 0.80 if ret_norm_max >0 else 1.0
+    context.eps = eps_factor*ret_norm_max
+    
+    bnds = []
+    limits = [0,1]
+    
+    for stock in context.stocks:
+        bnds.append(limits)
+           
+    bnds = tuple(tuple(x) for x in bnds)
+
+    cons = ({'type': 'eq', 'fun': lambda x:  np.sum(x)-1.0},
+            {'type': 'ineq', 'fun': lambda x:  np.dot(x,ret_norm)-context.eps})
+    
+    res= scipy.optimize.minimize(variance, context.x1, args=ret,jac=jac_variance, method='SLSQP',constraints=cons,bounds=bnds)
+
+    allocation = np.copy(context.x0)    
+    if res.success:    # if SLSQP declares success
+        context.opt_pass_count += 1
+        
+        weighted_ret_norm = np.dot(res.x,ret_norm)
+        w_ret_constraint = weighted_ret_norm - context.eps + context.tol
+       
+        if(w_ret_constraint > 0): # and constraint is actually met
+            context.valid_constraint_count += 1
+            allocation = res.x
+            allocation[allocation<0] = 0
+            denom = np.sum(allocation)
+            if denom > 0:
+                allocation = allocation/denom 
+                
+            msg = "{0} runs, {1} SLSQP passes, {2} constraints passed".format(
+                context.run_count, context.opt_pass_count,
+                context.valid_constraint_count)
+            if(context.run_count>1000): log.info(msg)
+        else:
+            log.info("constraint fail, SLSQP status = {0}".format(res.status))
+    else:
+        log.info("SLSQP fail, SLSQP status = {0}".format(res.status))
+    context.n += 1
+    context.s += allocation
+#
+#---------- end of debugging code
+def trade(context, data):
+    if context.n > 0:
+        allocation = context.s/context.n
+    else:
+        return
+    
+    context.n = 0
+    context.s = np.zeros_like(context.stocks)
+    context.x0 = allocation
+    
+    if get_open_orders():
+        return
+    
+    for i,stock in enumerate(context.stocks):
+        order_target_percent(stock,allocation[i]*.85)
+    log.info (", ".join(["%s %0.3f" % (stock.symbol, allocation[i]) for i,stock in enumerate(context.stocks)]))
+    log.info("*************************************************************")
+    log.info("\n")
+
+    
+def allocVOL(context, data):
+    vxx = context.stock1
+    xiv = context.stock2
+    WFV_limit= 14 #(Kory used 14 but it becomes a bit too agressive)
+    n = 28
+    vxx_prices = data.history(vxx, "price", n + 2, "1d")[:-1]
+    vxx_lows = data.history(vxx, "low", n + 2, "1d")[:-1]
+    vxx_highest = pd.rolling_max(vxx_prices, window = n)    
+    
+    #William's VIX Fix indicator a.k.a. the Synthetic VIX
+    WVF = ((vxx_highest - vxx_lows)/(vxx_highest)) * 100
+
+    record(wvf_vxx = WVF[-1]/100) #Plot WVF
+    
+    #Buy XIV using 100% of account when WVF crosses over 14 
+    if get_open_orders():
+        return
+    if(WVF[-2] < WFV_limit and WVF[-1] >= WFV_limit):
+        order_target_percent(vxx, 0.00)
+        order_target_percent(xiv, 0.07)
+        
+    #Sell position when WVF crosses under 14
+    elif(WVF[-2] > WFV_limit and WVF[-1] <= WFV_limit):
+        order_target_percent(xiv, 0.00) 
+        order_target_percent(vxx, 0.07)
+
+def variance(x,*args):
+    
+    p = np.squeeze(np.asarray(args))
+    Acov = np.cov(p.T)
+    
+    return np.dot(x,np.dot(Acov,x))
+
+def jac_variance(x,*args):
+    
+    p = np.squeeze(np.asarray(args))
+    Acov = np.cov(p.T)
+        
+    return 2*np.dot(Acov,x)
